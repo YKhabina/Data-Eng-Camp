@@ -9,5 +9,5 @@
 Этот репозиторий создан для хранения учебных и рабочих материалов в рамках **Data Engineering Camp**. 
 Здесь я буду хранить выполненные проекты.
 
-├── Postgres Trigger
-├── Clickhouse Metrics
+- Postgres Trigger;
+- Clickhouse Metric;
