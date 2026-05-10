@@ -91,5 +91,5 @@ $$ LANGUAGE plpgsql;
 SELECT cron.schedule(
     'daily_users_audit_exports',
     '0 3 * * *',
-    'SELECT export_fresh_changes();'
+    'SELECT export_yesterday_audit();'
 );
