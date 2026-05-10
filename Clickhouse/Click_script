@@ -1,1 +1,127 @@
+DROP TABLE IF EXISTS user_events;
 
+CREATE TABLE user_events (
+    user_id UInt32,
+    event_type String,
+    points_spent UInt32,
+    event_time DateTime
+) ENGINE = MergeTree()
+ORDER BY (event_time, user_id)
+TTL event_time + INTERVAL 30 day DELETE;
+--данные в этой таблице должны хранится 30 дней.
+
+--Запрос для вставки тестовых данных 
+INSERT INTO user_events VALUES
+-- События 10 дней назад
+(1, 'login', 0, now() - INTERVAL 10 DAY),
+(2, 'signup', 0, now() - INTERVAL 10 DAY),
+(3, 'login', 0, now() - INTERVAL 10 DAY),
+
+INSERT INTO user_events VALUES
+-- События 7 дней назад
+(1, 'login', 0, now() - INTERVAL 7 DAY),
+(2, 'login', 0, now() - INTERVAL 7 DAY),
+(3, 'purchase', 30, now() - INTERVAL 7 DAY),
+
+INSERT INTO user_events VALUES
+-- События 5 дней назад
+(1, 'purchase', 50, now() - INTERVAL 5 DAY),
+(2, 'logout', 0, now() - INTERVAL 5 DAY),
+(4, 'login', 0, now() - INTERVAL 5 DAY),
+
+--Построить агрегированную таблицу. Храним агрегаты 180 дней, чтобы делать трендовый анализ:
+--уникальные пользователи по event_type и event_date
+--сумма потраченных баллов
+--количество действий
+DROP TABLE IF EXISTS user_events_agg;
+CREATE TABLE user_events_agg (
+    event_date Date,
+    event_type String,
+    uniq_users AggregateFunction(uniq, UInt32),
+    total_points_spent AggregateFunction(sum, UInt64),
+    total_actions AggregateFunction(count, UInt8) 
+) ENGINE = AggregatingMergeTree()
+ORDER BY (event_date, event_type)
+TTL event_date + INTERVAL 180 DAY DELETE;
+
+--Сделать Materialized View, которая при вставке данных в таблицу сырых логов событий, 
+-- будет обновлять агрегированную таблицу
+-- использует sumState, uniqState, countState
+DROP TABLE IF EXISTS user_events_agg_mv;
+
+CREATE MATERIALIZED VIEW user_events_agg_mv
+TO user_events_agg
+AS SELECT
+    toDate(event_time) AS event_date,
+    event_type,
+    uniqState(user_id) AS uniq_users,
+    sumState(toUInt64(points_spent)) AS total_points_spent,   
+    countState() AS total_actions
+FROM user_events
+GROUP BY event_date, event_type;
+
+--для проверки мв и агг
+INSERT INTO user_events VALUES
+-- События 3 дня назад
+(1, 'login', 0, now() - INTERVAL 3 DAY),
+(3, 'purchase', 70, now() - INTERVAL 3 DAY),
+(5, 'signup', 0, now() - INTERVAL 3 DAY),
+
+INSERT INTO user_events VALUES
+-- События вчера
+(2, 'purchase', 20, now() - INTERVAL 1 DAY),
+(4, 'logout', 0, now() - INTERVAL 1 DAY),
+(5, 'login', 0, now() - INTERVAL 1 DAY),
+
+INSERT INTO user_events VALUES
+-- События сегодня
+(1, 'purchase', 25, now()),
+(2, 'login', 0, now()),
+(3, 'logout', 0, now()),
+(6, 'signup', 0, now()),
+(6, 'purchase', 100, now());
+
+-- Создать запрос, показывающий:
+-- Retention: сколько пользователей вернулись в течение следующих 7 дней. 
+-- Формат результата - total_users_day_0|returned_in_7_days|retention_7d_percent|
+--Retention = (Количество вернувшихся пользователей в дни (1...7) / 
+--Общее количество пользователей в начальный день (день 0)) * 100%
+
+WITH user_min_date AS (
+    SELECT
+        user_id,
+        MIN(toDate(event_time)) AS cohort_day
+    FROM user_events
+    GROUP BY user_id
+),
+-- Явно связываем каждого пользователя с его когортой
+user_cohort AS (
+    SELECT
+        user_id,
+        cohort_day
+    FROM user_min_date
+)
+SELECT
+    u.cohort_day,
+    COUNT(DISTINCT u.user_id) AS total_users_day_0,
+    COUNT(DISTINCT e.user_id) AS returned_in_7_days,
+    ROUND((COUNT(DISTINCT e.user_id) / COUNT(DISTINCT u.user_id)) * 100, 1) AS retention_7d_percent
+FROM user_cohort u
+LEFT JOIN user_events e ON e.user_id = u.user_id
+    AND toDate(e.event_time) BETWEEN u.cohort_day + 1 AND u.cohort_day + 7
+GROUP BY u.cohort_day
+ORDER BY u.cohort_day;
+
+
+-- Создать запрос с группировками по быстрой аналитике по дням, формат ниже.
+
+SELECT
+    event_date,
+    event_type,
+    uniqMerge(uniq_users) AS unique_users,      
+    sumMerge(total_points_spent) AS total_points, 
+    countMerge(total_actions) AS total_actions   
+FROM user_events_agg
+WHERE event_date >= today() - 5  --поставила за 5 дней 
+GROUP BY event_date, event_type
+ORDER BY event_date DESC, event_type;
